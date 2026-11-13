@@ -15,8 +15,8 @@ import { slugifyAgentBranchName } from '../utils/workflowRules.ts';
 import {
   formatGeminiErrorMessage,
   getActiveQuotaCooldown,
-  isQuotaExhaustedError,
   markQuotaCooldownFromError,
+  shouldFallbackUpstreamError,
 } from './quotaGuard.ts';
 import {
   buildIdempotencyKey,
@@ -113,6 +113,24 @@ function sleepAbortable(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
+function withUpstreamTimeout<T>(promise: Promise<T>, timeoutMs = 12000): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`Gemini upstream request timed out after ${timeoutMs}ms.`));
+    }, timeoutMs);
+    promise.then(
+      (val) => {
+        clearTimeout(timer);
+        resolve(val);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      }
+    );
+  });
+}
+
 function createGeminiDriver(apiKey: string): SolveModelDriver {
   const ai = new GoogleGenAI({
     apiKey,
@@ -133,33 +151,35 @@ function createGeminiDriver(apiKey: string): SolveModelDriver {
         guidance ? `Engineer Guidance: ${guidance}` : '',
         `Indexed Files:\n${indexedFiles.map((f) => `- ${f.path} (${f.lines} lines)`).join('\n')}`,
         `Inspected Source Files:\n${fileSnippets.map((f) => `--- ${f.path} ---\n${f.content}`).join('\n\n')}`,
-        `If requirements are genuinely ambiguous or missing critical business rules, return kind="needs_info" with 1-3 concrete questions. Otherwise return kind="plan" with targetFiles, concrete steps, and notes.`,
+        `If the ticket's core objective is contradictory or has zero actionable acceptance criteria, return kind="needs_info" with 1-3 concrete questions. Otherwise (including when minor defaults like retry count or optional parameter signature can follow repo conventions and acceptance criteria), return kind="plan" with targetFiles, concrete steps, and notes.`,
       ]
         .filter(Boolean)
         .join('\n\n');
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
-        contents: prompt,
-        config: {
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-          systemInstruction:
-            'Output strictly valid JSON matching the schema. Be concise. Only choose kind="needs_info" if the ticket lacks actionable requirements.',
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              kind: { type: Type.STRING },
-              questions: { type: Type.ARRAY, items: { type: Type.STRING } },
-              summary: { type: Type.STRING },
-              targetFiles: { type: Type.ARRAY, items: { type: Type.STRING } },
-              steps: { type: Type.ARRAY, items: { type: Type.STRING } },
-              notes: { type: Type.STRING },
+      const response = await withUpstreamTimeout(
+        ai.models.generateContent({
+          model: 'gemini-4-hydrogen',
+          contents: prompt,
+          config: {
+            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+            systemInstruction:
+              'Output strictly valid JSON matching the schema. Be concise. Prefer kind="plan" using clean idiomatic defaults whenever acceptance criteria and target files give an actionable goal; only use kind="needs_info" when requirements are genuinely contradictory or missing.',
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                kind: { type: Type.STRING },
+                questions: { type: Type.ARRAY, items: { type: Type.STRING } },
+                summary: { type: Type.STRING },
+                targetFiles: { type: Type.ARRAY, items: { type: Type.STRING } },
+                steps: { type: Type.ARRAY, items: { type: Type.STRING } },
+                notes: { type: Type.STRING },
+              },
+              required: ['kind', 'summary', 'targetFiles', 'steps', 'notes'],
             },
-            required: ['kind', 'summary', 'targetFiles', 'steps', 'notes'],
           },
-        },
-      });
+        })
+      );
 
       const parsed = JSON.parse((response.text ?? '{}').trim());
       if (parsed.kind === 'needs_info' && Array.isArray(parsed.questions) && parsed.questions.length > 0) {
@@ -190,52 +210,54 @@ function createGeminiDriver(apiKey: string): SolveModelDriver {
         `Current Pinned Source Files (use exact line content for replacements or createContent for new files):\n${fileSnippets
           .map((f) => `--- ${f.path} ---\n${f.content}`)
           .join('\n\n')}`,
-        `IMPORTANT: Any test files (*.test.ts) MUST import assertions from "vitest" (describe, expect, it) and import target functions with relative paths, and must be 100% valid runnable TypeScript so our isolated Node sandbox executes them cleanly.`,
+        `IMPORTANT: For TypeScript/JS test files (*.test.ts), import assertions from "vitest" (describe, expect, it) and import target functions with relative paths so our isolated Node sandbox runs them cleanly. For Python repos (*.py), write valid Python 3.11+ code and pytest tests.`,
       ]
         .filter(Boolean)
         .join('\n\n');
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
-        contents: prompt,
-        config: {
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-          systemInstruction:
-            'Output strictly valid JSON matching the schema. For existing files, provide exact substring replacements[{before, after}] matching the provided source text verbatim, OR provide full createContent for new/rewritten files. Keep unit tests self-contained (use in-memory fakes/mocks, no external network).',
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              prTitle: { type: Type.STRING },
-              prSummary: { type: Type.STRING },
-              edits: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    path: { type: Type.STRING },
-                    summary: { type: Type.STRING },
-                    replacements: {
-                      type: Type.ARRAY,
-                      items: {
-                        type: Type.OBJECT,
-                        properties: {
-                          before: { type: Type.STRING },
-                          after: { type: Type.STRING },
+      const response = await withUpstreamTimeout(
+        ai.models.generateContent({
+          model: 'gemini-4-hydrogen',
+          contents: prompt,
+          config: {
+            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+            systemInstruction:
+              'Output strictly valid JSON matching the schema. For files under 80 lines, provide full createContent to avoid anchor mismatches; for larger files, provide exact verbatim replacements[{before, after}]. Keep unit tests self-contained (no external network, no vi.mock module mocking).',
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                prTitle: { type: Type.STRING },
+                prSummary: { type: Type.STRING },
+                edits: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      path: { type: Type.STRING },
+                      summary: { type: Type.STRING },
+                      replacements: {
+                        type: Type.ARRAY,
+                        items: {
+                          type: Type.OBJECT,
+                          properties: {
+                            before: { type: Type.STRING },
+                            after: { type: Type.STRING },
+                          },
+                          required: ['before', 'after'],
                         },
-                        required: ['before', 'after'],
                       },
+                      createContent: { type: Type.STRING },
                     },
-                    createContent: { type: Type.STRING },
+                    required: ['path', 'summary'],
                   },
-                  required: ['path', 'summary'],
                 },
               },
+              required: ['prTitle', 'prSummary', 'edits'],
             },
-            required: ['prTitle', 'prSummary', 'edits'],
           },
-        },
-      });
+        })
+      );
 
       const parsed = JSON.parse((response.text ?? '{}').trim());
       return {
@@ -663,7 +685,7 @@ function wrapDriverWithQuotaFallback(
       try {
         return await primary.generatePlan(input);
       } catch (err) {
-        if (isQuotaExhaustedError(err)) {
+        if (shouldFallbackUpstreamError(err)) {
           triggerFallback(err);
           return fallback.generatePlan(input);
         }
@@ -677,7 +699,7 @@ function wrapDriverWithQuotaFallback(
       try {
         return await primary.generatePatch(input);
       } catch (err) {
-        if (isQuotaExhaustedError(err)) {
+        if (shouldFallbackUpstreamError(err)) {
           triggerFallback(err);
           return fallback.generatePatch(input);
         }

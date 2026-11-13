@@ -6,8 +6,10 @@ import {
   formatGeminiErrorMessage,
   getActiveQuotaCooldown,
   isQuotaExhaustedError,
+  isTransientUpstreamError,
   markQuotaCooldownFromError,
   parseRetryDelaySeconds,
+  shouldFallbackUpstreamError,
 } from './quotaGuard';
 
 const EXACT_429_PAYLOAD = JSON.stringify({
@@ -28,6 +30,7 @@ const EXACT_429_PAYLOAD = JSON.stringify({
 test('detects 429 RESOURCE_EXHAUSTED payload and parses retry delay cleanly', () => {
   const err = new Error(EXACT_429_PAYLOAD);
   assert.equal(isQuotaExhaustedError(err), true);
+  assert.equal(shouldFallbackUpstreamError(err), true);
   assert.equal(parseRetryDelaySeconds(err), 16564);
   assert.equal(formatDurationShort(16564), '4h 36m');
 
@@ -37,9 +40,19 @@ test('detects 429 RESOURCE_EXHAUSTED payload and parses retry delay cleanly', ()
   assert.doesNotMatch(formatted, /\{|\}/);
 });
 
-test('does not misclassify ordinary domain errors as quota exhaustion', () => {
+test('detects 503 high-demand upstream unavailability and switches cleanly without misclassifying domain errors', () => {
+  const busyErr = new Error(
+    'This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.'
+  );
+  assert.equal(isQuotaExhaustedError(busyErr), false);
+  assert.equal(isTransientUpstreamError(busyErr), true);
+  assert.equal(shouldFallbackUpstreamError(busyErr), true);
+  assert.match(formatGeminiErrorMessage(busyErr), /503 high demand/);
+
   const err = new Error('Anchor #1 not found in src/index.ts');
   assert.equal(isQuotaExhaustedError(err), false);
+  assert.equal(isTransientUpstreamError(err), false);
+  assert.equal(shouldFallbackUpstreamError(err), false);
   assert.equal(formatGeminiErrorMessage(err), 'Anchor #1 not found in src/index.ts');
 });
 

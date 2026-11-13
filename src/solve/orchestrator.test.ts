@@ -390,4 +390,46 @@ test('Re-running with existing open Draft PR on identical headBranch updates ide
   assert.equal(secondRun.prResult?.number, 1089);
 });
 
+test('Stage 3 503 high-demand error falls back cleanly to built-in engine and opens Draft PR', async () => {
+  const busyStage3Driver: SolveModelDriver = {
+    async generatePlan() {
+      return {
+        kind: 'plan',
+        plan: {
+          summary: 'Plan created before 503 high-demand error in Stage 3',
+          targetFiles: [
+            'src/webhooks/verifyStripeSignature.ts',
+            'src/webhooks/verifyStripeSignature.test.ts',
+          ],
+          steps: ['Enforce 300s tolerance window', 'Use crypto.timingSafeEqual'],
+          notes: 'Preserve exported signature',
+        },
+      };
+    },
+    async generatePatch() {
+      throw new Error(
+        'This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.'
+      );
+    },
+  };
+
+  const run = await runSolvePipeline({
+    runId: 'run-503-stage3',
+    ticket: makeTicket(),
+    baseSha: 'a4f9c2e8b10d3e7f6a92c4180d5e2b7a1c3f8901',
+    scopeRevision: 1,
+    executionMode: 'bounded',
+    maxModelCalls: 3,
+    testCommand: 'npx vitest run',
+    nextPrNumber: 1090,
+    modelDriver: busyStage3Driver,
+  });
+
+  assert.equal(run.status, 'succeeded');
+  assert.equal(run.source, 'deterministic');
+  assert.match(run.fallbackReason || '', /503 high demand/);
+  assert.equal(run.verification?.status, 'passed');
+  assert.equal(run.jiraStatusCurrent, 'in_review');
+  assert.equal(run.prResult?.number, 1090);
+});
 

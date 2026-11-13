@@ -51,6 +51,71 @@ function createExpectAssertion(actual: unknown) {
         throw new Error(`Expected value ${negated ? 'not ' : ''}to be defined`);
       }
     },
+    toBeUndefined() {
+      const pass = actual === undefined;
+      if (negated ? pass : !pass) {
+        throw new Error(`Expected value ${negated ? 'not ' : ''}to be undefined`);
+      }
+    },
+    toBeNull() {
+      const pass = actual === null;
+      if (negated ? pass : !pass) {
+        throw new Error(`Expected value ${negated ? 'not ' : ''}to be null`);
+      }
+    },
+    toBeGreaterThan(expected: number) {
+      const pass = typeof actual === 'number' && actual > expected;
+      if (negated ? pass : !pass) {
+        throw new Error(`Expected ${actual} ${negated ? 'not ' : ''}to be > ${expected}`);
+      }
+    },
+    toBeGreaterThanOrEqual(expected: number) {
+      const pass = typeof actual === 'number' && actual >= expected;
+      if (negated ? pass : !pass) {
+        throw new Error(`Expected ${actual} ${negated ? 'not ' : ''}to be >= ${expected}`);
+      }
+    },
+    toBeLessThan(expected: number) {
+      const pass = typeof actual === 'number' && actual < expected;
+      if (negated ? pass : !pass) {
+        throw new Error(`Expected ${actual} ${negated ? 'not ' : ''}to be < ${expected}`);
+      }
+    },
+    toBeLessThanOrEqual(expected: number) {
+      const pass = typeof actual === 'number' && actual <= expected;
+      if (negated ? pass : !pass) {
+        throw new Error(`Expected ${actual} ${negated ? 'not ' : ''}to be <= ${expected}`);
+      }
+    },
+    toBeCloseTo(expected: number, precision = 2) {
+      const pass =
+        typeof actual === 'number' &&
+        Math.abs(actual - expected) < Math.pow(10, -precision) / 2;
+      if (negated ? pass : !pass) {
+        throw new Error(`Expected ${actual} ${negated ? 'not ' : ''}to be close to ${expected}`);
+      }
+    },
+    toMatch(pattern: string | RegExp) {
+      const regex = typeof pattern === 'string' ? new RegExp(pattern) : pattern;
+      const pass = typeof actual === 'string' && regex.test(actual);
+      if (negated ? pass : !pass) {
+        throw new Error(`Expected ${JSON.stringify(actual)} ${negated ? 'not ' : ''}to match ${pattern}`);
+      }
+    },
+    toHaveLength(expected: number) {
+      const len =
+        typeof actual === 'string' || Array.isArray(actual) ? actual.length : -1;
+      const pass = len === expected;
+      if (negated ? pass : !pass) {
+        throw new Error(`Expected length ${len} ${negated ? 'not ' : ''}to be ${expected}`);
+      }
+    },
+    toBeInstanceOf(expectedClass: new (...args: unknown[]) => unknown) {
+      const pass = actual instanceof expectedClass;
+      if (negated ? pass : !pass) {
+        throw new Error(`Expected value ${negated ? 'not ' : ''}to be instance of ${expectedClass.name}`);
+      }
+    },
     toContain(item: unknown) {
       const pass =
         typeof actual === 'string'
@@ -133,6 +198,13 @@ function transpileTsToCommonJs(source: string, filePath: string): string {
       return `const { ${mapped} } = __require("${mod}");`;
     })
     .replace(/export\s+default\s+/g, 'module.exports.default = ')
+    .replace(/export\s*\{([^}]+)\};?/g, (_m, names: string) => {
+      for (const raw of names.split(',')) {
+        const cleaned = raw.trim().split(/\s+as\s+/).pop()?.trim();
+        if (cleaned) exportedNames.push(cleaned);
+      }
+      return '';
+    })
     .replace(/export\s+(async\s+function\s+([\w$]+))/g, (_m, decl: string, name: string) => {
       exportedNames.push(name);
       return decl;
@@ -193,6 +265,23 @@ export async function runIsolatedVerification(
     return function __require(specifier: string): unknown {
       if (specifier === 'node:crypto' || specifier === 'crypto') return crypto;
       if (specifier === 'vitest' || specifier === 'node:test') {
+        const makeSpy = (impl?: (...args: unknown[]) => unknown) => {
+          const calls: unknown[][] = [];
+          const fn = (...args: unknown[]) => {
+            calls.push(args);
+            return impl ? impl(...args) : undefined;
+          };
+          fn.mock = { calls };
+          fn.mockImplementation = (nextImpl: (...args: unknown[]) => unknown) => {
+            impl = nextImpl;
+            return fn;
+          };
+          fn.mockReturnValue = (val: unknown) => {
+            impl = () => val;
+            return fn;
+          };
+          return fn;
+        };
         return {
           describe(name: string, fn: () => void) {
             const prev = currentSuite;
@@ -208,6 +297,24 @@ export async function runIsolatedVerification(
           },
           test(name: string, fn: () => void | Promise<void>) {
             recordedTests.push({ suite: fromPath, name, fn });
+          },
+          beforeEach() {
+            // no-op hook shim for simple unit suites
+          },
+          afterEach() {
+            // no-op hook shim for simple unit suites
+          },
+          vi: {
+            fn: makeSpy,
+            spyOn(target: Record<string, unknown>, key: string) {
+              const orig = typeof target[key] === 'function' ? (target[key] as (...args: unknown[]) => unknown).bind(target) : undefined;
+              const spy = makeSpy(orig);
+              target[key] = spy;
+              return spy;
+            },
+            restoreAllMocks() {
+              // no-op
+            },
           },
           expect: createExpectAssertion,
         };

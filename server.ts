@@ -9,8 +9,8 @@ import { runSolvePipeline } from './src/solve/orchestrator.ts';
 import {
   formatGeminiErrorMessage,
   getActiveQuotaCooldown,
-  isQuotaExhaustedError,
   markQuotaCooldownFromError,
+  shouldFallbackUpstreamError,
 } from './src/solve/quotaGuard.ts';
 import {
   buildIdempotencyKey,
@@ -678,9 +678,9 @@ async function startServer() {
         testSuite,
       });
     } catch (err) {
-      if (isQuotaExhaustedError(err)) {
+      if (shouldFallbackUpstreamError(err)) {
         const fallbackReason = markQuotaCooldownFromError(err, apiKey);
-        console.warn('Gemini /api/ai/generate-pr quota fallback:', fallbackReason);
+        console.warn('Gemini /api/ai/generate-pr fallback:', fallbackReason);
         return res.json({
           ...buildDeterministicPrSynthesis(ticket, guidance),
           fallbackReason,
@@ -813,7 +813,7 @@ async function startServer() {
         findings,
       });
     } catch (err) {
-      const reason = isQuotaExhaustedError(err)
+      const reason = shouldFallbackUpstreamError(err)
         ? markQuotaCooldownFromError(err, apiKey)
         : formatGeminiErrorMessage(err);
       console.warn('Gemini /api/ai/review-pr fallback:', reason);

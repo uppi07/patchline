@@ -41,6 +41,41 @@ export function isQuotaExhaustedError(err: unknown): boolean {
   );
 }
 
+export function isTransientUpstreamError(err: unknown): boolean {
+  if (!err) return false;
+  if (typeof err === 'object') {
+    const record = err as Record<string, unknown>;
+    if (record.status === 503 || record.code === 503 || record.status === 502 || record.status === 504) {
+      return true;
+    }
+    const nested = record.error as Record<string, unknown> | undefined;
+    if (nested && (nested.code === 503 || nested.status === 'UNAVAILABLE' || nested.code === 502 || nested.code === 504)) {
+      return true;
+    }
+  }
+  const text =
+    err instanceof Error
+      ? err.message
+      : typeof err === 'string'
+      ? err
+      : JSON.stringify(err);
+  const lower = text.toLowerCase();
+  return (
+    lower.includes('high demand') ||
+    lower.includes('unavailable') ||
+    lower.includes('overloaded') ||
+    lower.includes('"code":503') ||
+    lower.includes('status 503') ||
+    lower.includes('try again later') ||
+    lower.includes('timed out') ||
+    lower.includes('timeout')
+  );
+}
+
+export function shouldFallbackUpstreamError(err: unknown): boolean {
+  return isQuotaExhaustedError(err) || isTransientUpstreamError(err);
+}
+
 export function parseRetryDelaySeconds(err: unknown): number | null {
   const text =
     err instanceof Error
@@ -86,6 +121,10 @@ export function formatGeminiErrorMessage(err: unknown): string {
     return `Gemini Free Tier daily quota reached${retryNote} — switched to built-in engine.`;
   }
 
+  if (isTransientUpstreamError(err)) {
+    return 'Gemini upstream temporarily busy (503 high demand) — switched to built-in engine.';
+  }
+
   const raw =
     err instanceof Error
       ? err.message
@@ -111,7 +150,13 @@ export function markQuotaCooldownFromError(
   model = 'gemini-4-hydrogen'
 ): string {
   const retrySec = parseRetryDelaySeconds(err);
-  const boundedSec = retrySec ? Math.min(retrySec, 4 * 3600) : 15 * 60;
+  const boundedSec = isQuotaExhaustedError(err)
+    ? retrySec
+      ? Math.min(retrySec, 4 * 3600)
+      : 15 * 60
+    : retrySec
+    ? Math.min(retrySec, 5 * 60)
+    : 90;
   const reason = formatGeminiErrorMessage(err);
   quotaCooldowns.set(cooldownKey(apiKey, model), {
     untilMs: Date.now() + boundedSec * 1000,
