@@ -1,0 +1,8 @@
+{
+  "name": "Patchline",
+  "description": "AI-powered developer workbench that turns Jira tickets into tested code changes and reviewable GitHub pull requests, with one-click AI code review and human-controlled merge gates.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
