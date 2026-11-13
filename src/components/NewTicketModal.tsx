@@ -20,7 +20,9 @@ export function NewTicketModal({
 }: NewTicketModalProps) {
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
-  const [repo, setRepo] = useState(repositories[0]?.fullName || 'acme-corp/payments-api');
+  const [repo, setRepo] = useState('auto');
+  const [baseBranch, setBaseBranch] = useState('main');
+  const [labelsText, setLabelsText] = useState('');
   const [priority, setPriority] = useState<TicketPriority>('High');
   const [acceptanceCriteriaText, setAcceptanceCriteriaText] = useState('');
   const [targetFilesText, setTargetFilesText] = useState('');
@@ -32,11 +34,15 @@ export function NewTicketModal({
 
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();
+    const isAuto = repo === 'auto';
     const input: NewTicketInput = {
       key: suggestedKey,
       title,
       description,
-      repo,
+      repo: isAuto ? 'auto' : repo,
+      baseBranch: baseBranch.trim() || 'main',
+      labelsText,
+      repoResolution: isAuto ? 'auto' : 'explicit',
       priority,
       acceptanceCriteriaText,
       targetFilesText,
@@ -51,6 +57,8 @@ export function NewTicketModal({
     onCreateTicket(input);
     setTitle('');
     setDescription('');
+    setBaseBranch('main');
+    setLabelsText('');
     setAcceptanceCriteriaText('');
     setTargetFilesText('');
     setErrors({});
@@ -119,9 +127,15 @@ export function NewTicketModal({
               <select
                 id="new-ticket-repo"
                 value={repo}
-                onChange={(e) => setRepo(e.target.value)}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  setRepo(val);
+                  const found = repositories.find((r) => r.fullName === val);
+                  if (found) setBaseBranch(found.defaultBranch);
+                }}
                 className="mt-1 h-9 w-full rounded-lg border border-slate-200 bg-slate-50 px-2.5 text-xs text-slate-900 focus:border-blue-600 focus:bg-white focus:outline-none dark:border-slate-800 dark:bg-slate-950 dark:text-slate-100"
               >
+                <option value="auto">Auto-resolve (Project / Labels / Hints)</option>
                 {repositories.map((r) => (
                   <option key={r.id} value={r.fullName}>
                     {r.fullName}
@@ -151,6 +165,42 @@ export function NewTicketModal({
                 <option value="Medium">Medium</option>
                 <option value="Low">Low</option>
               </select>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label
+                htmlFor="new-ticket-branch"
+                className="block text-xs font-medium text-slate-700 dark:text-slate-300"
+              >
+                Base Branch
+              </label>
+              <input
+                id="new-ticket-branch"
+                type="text"
+                value={baseBranch}
+                onChange={(e) => setBaseBranch(e.target.value)}
+                placeholder="main"
+                className="mt-1 h-9 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 font-mono text-xs text-slate-900 focus:border-blue-600 focus:bg-white focus:outline-none dark:border-slate-800 dark:bg-slate-950 dark:text-slate-100"
+              />
+            </div>
+
+            <div>
+              <label
+                htmlFor="new-ticket-labels"
+                className="block text-xs font-medium text-slate-700 dark:text-slate-300"
+              >
+                Jira Labels (optional)
+              </label>
+              <input
+                id="new-ticket-labels"
+                type="text"
+                value={labelsText}
+                onChange={(e) => setLabelsText(e.target.value)}
+                placeholder="repo:..., branch:release/v2.4"
+                className="mt-1 h-9 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 font-mono text-xs text-slate-900 focus:border-blue-600 focus:bg-white focus:outline-none dark:border-slate-800 dark:bg-slate-950 dark:text-slate-100"
+              />
             </div>
           </div>
 

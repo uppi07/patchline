@@ -68,6 +68,34 @@ export interface SolvePlan {
   notes: string;
 }
 
+export type RepoResolutionLevel = 1 | 2 | 3 | 4;
+export type RepoResolutionStatus = 'resolved' | 'ambiguous';
+
+export interface RepoResolutionCandidate {
+  repo: string;
+  baseBranch: string;
+  packagePath?: string;
+  score: number;
+  matchedBy: string;
+}
+
+export interface RepoResolutionResult {
+  status: RepoResolutionStatus;
+  level: RepoResolutionLevel;
+  strategy:
+    | 'explicit_override'
+    | 'jira_label'
+    | 'project_component'
+    | 'path_hint'
+    | 'ambiguous_gate';
+  resolvedRepo?: string;
+  baseBranch?: string;
+  packagePath?: string;
+  confidence: 'exact' | 'high' | 'medium' | 'ambiguous';
+  summary: string;
+  candidates: RepoResolutionCandidate[];
+}
+
 export interface SolveRun {
   id: string;
   ticketId: string;
@@ -75,6 +103,11 @@ export interface SolveRun {
   repo: string;
   baseBranch: string;
   baseSha: string;
+  upstreamHeadSha?: string;
+  packagePath?: string;
+  idempotencyKey?: string;
+  reusedExistingPr?: boolean;
+  repoResolution?: RepoResolutionResult;
   scopeRevision: number;
   executionMode: SolveExecutionMode;
   maxModelCalls: number | null;
@@ -152,6 +185,8 @@ export interface PullRequest {
   baseBranch: string;
   baseSha?: string;
   headBranch: string;
+  packagePath?: string;
+  idempotencyKey?: string;
   commitSha?: string;
   draft?: boolean;
   linkedTicketKey?: string;
@@ -182,6 +217,12 @@ export interface JiraTicket {
   repo: string;
   baseBranch: string;
   pinnedSha?: string;
+  jiraProject?: string;
+  components?: string[];
+  labels?: string[];
+  packagePath?: string;
+  repoResolution?: 'auto' | 'explicit';
+  crossRepoDependencies?: string[];
   targetFiles: string[];
   priority: TicketPriority;
   storyPoints: number;
@@ -196,8 +237,13 @@ export interface RepositoryConfig {
   fullName: string;
   defaultBranch: string;
   pinnedSha: string;
+  upstreamHeadSha?: string;
   language: string;
   testCommand: string;
+  jiraProjects?: string[];
+  jiraComponents?: string[];
+  monorepoPackages?: string[];
+  jiraReviewTransition?: string;
   requireHumanApproval: boolean;
   autoRunAiReview: boolean;
   openPrCount: number;
@@ -208,6 +254,10 @@ export interface NewTicketInput {
   title: string;
   description: string;
   repo: string;
+  baseBranch?: string;
+  labelsText?: string;
+  packagePath?: string;
+  repoResolution?: 'auto' | 'explicit';
   priority: TicketPriority;
   acceptanceCriteriaText: string;
   targetFilesText: string;

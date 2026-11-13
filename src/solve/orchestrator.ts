@@ -4,6 +4,7 @@ import type {
   JiraTicket,
   PublishCheckpoint,
   PullRequest,
+  RepositoryConfig,
   SolveExecutionMode,
   SolvePlan,
   SolveRun,
@@ -17,6 +18,12 @@ import {
   isQuotaExhaustedError,
   markQuotaCooldownFromError,
 } from './quotaGuard.ts';
+import {
+  buildIdempotencyKey,
+  detectUpstreamDrift,
+  getJiraTransitionLabel,
+  resolveTargetRepository,
+} from './repoResolver.ts';
 import { runBaselineComparison, runIsolatedVerification } from './verifier.ts';
 import { WorkspaceSnapshot } from './workspace.ts';
 
@@ -30,6 +37,9 @@ export interface StartSolveParams {
   testCommand: string;
   guidance?: string;
   nextPrNumber: number;
+  repositories?: RepositoryConfig[];
+  existingOpenPr?: PullRequest;
+  upstreamHeadSha?: string;
   geminiApiKey?: string;
   signal?: AbortSignal;
   onUpdate?: (run: SolveRun) => void;
@@ -492,6 +502,94 @@ function createDeterministicDriver(): SolveModelDriver {
         };
       }
 
+      if (ticket.key === 'PLAT-431' || ticket.repo === 'acme-corp/platform-monorepo') {
+        return {
+          prTitle: `feat(retry-policy): add bounded full-jitter exponential backoff (${ticket.key})`,
+          prSummary: `Implements deterministic/bounded full-jitter backoff inside packages/retry-policy without triggering unrelated edge-gateway suites.${guidance ? ` Note: ${guidance}` : ''}`,
+          edits: [
+            {
+              path: 'packages/retry-policy/src/backoff.ts',
+              summary: 'Add jitter support and maxMs upper clamp to computeBackoffDelay',
+              createContent: [
+                'export interface BackoffOptions {',
+                '  baseMs: number;',
+                '  maxMs: number;',
+                '  jitterRatio?: number;',
+                '}',
+                '',
+                'export function computeBackoffDelay(attempt: number, opts: BackoffOptions, randomFn = Math.random): number {',
+                '  const exp = opts.baseMs * Math.pow(2, Math.max(0, attempt));',
+                '  const capped = Math.min(opts.maxMs, exp);',
+                '  const ratio = Math.min(1, Math.max(0, opts.jitterRatio ?? 0.2));',
+                '  const jitter = Math.floor(capped * ratio * randomFn());',
+                '  return Math.min(opts.maxMs, Math.max(0, capped - jitter));',
+                '}',
+              ].join('\n'),
+            },
+            {
+              path: 'packages/retry-policy/src/backoff.test.ts',
+              summary: 'Verify exponential cap and jitter bounds within retry-policy package',
+              createContent: [
+                'import { describe, expect, it } from "vitest";',
+                'import { computeBackoffDelay } from "./backoff";',
+                '',
+                'describe("computeBackoffDelay", () => {',
+                '  it("caps delay at maxMs", () => {',
+                '    expect(computeBackoffDelay(10, { baseMs: 100, maxMs: 2000 }, () => 0)).toBe(2000);',
+                '  });',
+                '  it("applies bounded jitter without exceeding maxMs", () => {',
+                '    const d = computeBackoffDelay(2, { baseMs: 100, maxMs: 2000, jitterRatio: 0.25 }, () => 1);',
+                '    expect(d).toBe(300);',
+                '  });',
+                '});',
+              ].join('\n'),
+            },
+          ],
+        };
+      }
+
+      if (ticket.key === 'BILL-204' || fileSnippets.some((f) => f.path.endsWith('.py'))) {
+        return {
+          prTitle: `fix(billing-worker): route failed invoice PDFs to DLQ after retry (${ticket.key})`,
+          prSummary: `Wraps invoice PDF uploads in a bounded asyncio semaphore and forwards exhausted uploads to dead_letter_queue.${guidance ? ` Note: ${guidance}` : ''}`,
+          edits: [
+            {
+              path: 'worker/invoice_uploader.py',
+              summary: 'Add dead-letter fallback for timed-out invoice uploads',
+              createContent: [
+                'import asyncio',
+                '',
+                'async def upload_monthly_batch(invoices, client, dlq=None):',
+                '    semaphore = asyncio.Semaphore(8)',
+                '    succeeded = []',
+                '    async def _upload(inv):',
+                '        async with semaphore:',
+                '            try:',
+                '                res = await client.put_pdf(inv.id, inv.bytes)',
+                '                succeeded.append(res)',
+                '            except Exception as exc:',
+                '                if dlq is not None:',
+                '                    await dlq.enqueue(inv.id, str(exc))',
+                '    await asyncio.gather(*[_upload(i) for i in invoices])',
+                '    return succeeded',
+              ].join('\n'),
+            },
+            {
+              path: 'tests/test_invoice_uploader.py',
+              summary: 'Add pytest coverage for bounded concurrency and DLQ fallback',
+              createContent: [
+                'import pytest',
+                'from worker.invoice_uploader import upload_monthly_batch',
+                '',
+                '@pytest.mark.asyncio',
+                'async def test_upload_monthly_batch_routes_failures_to_dlq():',
+                '    assert callable(upload_monthly_batch)',
+              ].join('\n'),
+            },
+          ],
+        };
+      }
+
       const primaryFile =
         ticket.targetFiles[0] || fileSnippets[0]?.path || 'src/index.ts';
       const testFile =
@@ -601,13 +699,16 @@ export async function runSolvePipeline(params: StartSolveParams): Promise<SolveR
   const {
     runId,
     ticket,
-    baseSha,
+    baseSha: initialBaseSha,
     scopeRevision,
     executionMode,
     maxModelCalls,
-    testCommand,
+    testCommand: initialTestCommand,
     guidance,
     nextPrNumber,
+    repositories = [],
+    existingOpenPr,
+    upstreamHeadSha: explicitUpstreamSha,
     geminiApiKey,
     signal,
     onUpdate,
@@ -619,13 +720,62 @@ export async function runSolvePipeline(params: StartSolveParams): Promise<SolveR
     !modelDriver && hasLiveGemini ? getActiveQuotaCooldown(geminiApiKey) : null;
   const fallbackDriver = createDeterministicDriver();
 
+  const resolution =
+    repositories.length > 0
+      ? resolveTargetRepository(ticket, repositories)
+      : {
+          status: 'resolved' as const,
+          level: 1 as const,
+          strategy: 'explicit_override' as const,
+          resolvedRepo: ticket.repo,
+          baseBranch: ticket.baseBranch || 'main',
+          packagePath: ticket.packagePath,
+          confidence: 'exact' as const,
+          summary: `Explicit target ${ticket.repo} @ ${ticket.baseBranch || 'main'}.`,
+          candidates: [
+            {
+              repo: ticket.repo,
+              baseBranch: ticket.baseBranch || 'main',
+              packagePath: ticket.packagePath,
+              score: 100,
+              matchedBy: 'explicit ticket repository',
+            },
+          ],
+        };
+
+  const resolvedRepoName = resolution.resolvedRepo || ticket.repo || 'unresolved';
+  const resolvedBaseBranch = resolution.baseBranch || ticket.baseBranch || 'main';
+  const resolvedRepoConfig = repositories.find((r) => r.fullName === resolvedRepoName);
+  const baseSha =
+    resolvedRepoConfig?.pinnedSha && resolution.level >= 2
+      ? resolvedRepoConfig.pinnedSha
+      : initialBaseSha;
+  const testCommand =
+    resolvedRepoConfig?.testCommand && resolution.level >= 2
+      ? resolvedRepoConfig.testCommand
+      : initialTestCommand;
+  const packagePath = resolution.packagePath || ticket.packagePath;
+  const upstreamHeadSha = explicitUpstreamSha || resolvedRepoConfig?.upstreamHeadSha || baseSha;
+  const idempotencyKey = buildIdempotencyKey(ticket.key, scopeRevision, baseSha);
+
+  const effectiveTicket: JiraTicket = {
+    ...ticket,
+    repo: resolvedRepoName,
+    baseBranch: resolvedBaseBranch,
+    packagePath,
+  };
+
   const run: SolveRun = {
     id: runId,
     ticketId: ticket.id,
     ticketKey: ticket.key,
-    repo: ticket.repo,
-    baseBranch: ticket.baseBranch,
+    repo: resolvedRepoName,
+    baseBranch: resolvedBaseBranch,
     baseSha,
+    upstreamHeadSha,
+    packagePath,
+    idempotencyKey,
+    repoResolution: resolution,
     scopeRevision,
     executionMode,
     maxModelCalls,
@@ -721,28 +871,58 @@ export async function runSolvePipeline(params: StartSolveParams): Promise<SolveR
     emit();
 
     // ------------------------------------------------------------------
+    // STAGE 0 AMBIGUITY GATE: Never guess repo or base branch blindly
+    // ------------------------------------------------------------------
+    if (resolution.status === 'ambiguous') {
+      const candidateList = resolution.candidates
+        .map((c) => `${c.repo} (${c.baseBranch}${c.matchedBy ? ` — ${c.matchedBy}` : ''})`)
+        .join(', ');
+      run.status = 'needs_info';
+      run.questions = [
+        `Multiple or zero repositories matched ${ticket.key}. Confirm the exact target repository and base branch (${candidateList}).`,
+        'If this is a monorepo change, specify the target package folder (e.g., packages/retry-policy).',
+      ];
+      run.error = `${resolution.summary} Jira kept in To Do.`;
+      emit();
+      return run;
+    }
+
+    // ------------------------------------------------------------------
     // STAGE 1: Materialize & Index pinned SHA (Jira remains To Do)
     // ------------------------------------------------------------------
     checkCancelled();
-    const workspace = new WorkspaceSnapshot(ticket.repo, baseSha, ticket.targetFiles);
+    const workspace = new WorkspaceSnapshot(
+      effectiveTicket.repo,
+      baseSha,
+      effectiveTicket.targetFiles,
+      packagePath
+    );
     const indexedFiles = workspace.indexFiles();
+    const totalRepoFiles = workspace.getTotalRepoFilesCount();
     run.indexedFilesCount = indexedFiles.length;
 
+    const drift = detectUpstreamDrift(baseSha, upstreamHeadSha);
     const searchQueries = [
-      ...ticket.targetFiles.map((p) => p.split('/').pop()?.replace(/\..+$/, '') || ''),
-      ...ticket.title.split(/\s+/).filter((w) => w.length > 4).slice(0, 3),
+      ...effectiveTicket.targetFiles.map((p) => p.split('/').pop()?.replace(/\..+$/, '') || ''),
+      ...effectiveTicket.title.split(/\s+/).filter((w) => w.length > 4).slice(0, 3),
     ].filter(Boolean);
 
     const searchStart = Date.now();
-    const matchedPaths = new Set<string>(ticket.targetFiles);
+    const matchedPaths = new Set<string>(effectiveTicket.targetFiles);
     for (const q of searchQueries.slice(0, 4)) {
       for (const match of workspace.searchCode(q)) {
         matchedPaths.add(match.path);
       }
     }
+    const scopeNote = packagePath
+      ? ` (monorepo scoped to ${packagePath}: ${indexedFiles.length}/${totalRepoFiles} files)`
+      : '';
+    const driftNote = drift.drifted
+      ? `; upstream ${resolvedBaseBranch} moved to ${drift.headSha.slice(0, 7)}`
+      : '';
     recordTool(
       'search_code',
-      `Indexed ${indexedFiles.length} files at ${baseSha.slice(0, 7)}; matched ${matchedPaths.size} candidate file(s)`,
+      `Level ${resolution.level} (${resolution.strategy}) -> ${effectiveTicket.repo}@${baseSha.slice(0, 7)}${scopeNote}${driftNote}; matched ${matchedPaths.size} candidate file(s)`,
       true,
       Math.max(4, Date.now() - searchStart)
     );
@@ -788,7 +968,7 @@ export async function runSolvePipeline(params: StartSolveParams): Promise<SolveR
     emit();
 
     const planOutcome = await driver.generatePlan({
-      ticket,
+      ticket: effectiveTicket,
       indexedFiles: indexedFiles.map((f) => ({ path: f.path, lines: f.lines })),
       fileSnippets,
       guidance,
@@ -832,13 +1012,14 @@ export async function runSolvePipeline(params: StartSolveParams): Promise<SolveR
           (f) =>
             matchedPaths.has(f.path) ||
             run.plan?.targetFiles.includes(f.path) ||
-            f.path.startsWith('src/')
+            f.path.startsWith('src/') ||
+            (packagePath ? f.path.startsWith(`${packagePath}/`) : false)
         )
         .slice(0, 6)
         .map((f) => ({ path: f.path, content: f.content }));
 
       patchResult = await driver.generatePatch({
-        ticket,
+        ticket: effectiveTicket,
         plan: run.plan!,
         fileSnippets: currentSnippets,
         repairFeedback,
@@ -913,7 +1094,12 @@ export async function runSolvePipeline(params: StartSolveParams): Promise<SolveR
     emit();
 
     if (finalCheck.report.status !== 'passed') {
-      const baseline = await runBaselineComparison(ticket.repo, baseSha, testCommand);
+      const baseline = await runBaselineComparison(
+        effectiveTicket.repo,
+        baseSha,
+        testCommand,
+        packagePath
+      );
       run.verification = {
         ...finalCheck.report,
         baselineCheck: baseline,
@@ -932,8 +1118,17 @@ export async function runSolvePipeline(params: StartSolveParams): Promise<SolveR
     checkCancelled();
     const changedFiles = workspace.computeChangedFiles();
     const headBranch = slugifyAgentBranchName(ticket.key, baseSha);
+    const reusedPr =
+      existingOpenPr &&
+      existingOpenPr.status !== 'merged' &&
+      existingOpenPr.headBranch === headBranch
+        ? existingOpenPr
+        : undefined;
+    run.reusedExistingPr = Boolean(reusedPr);
+    const prNumber = reusedPr ? reusedPr.number : nextPrNumber;
+    const prId = reusedPr ? reusedPr.id : `pr-${prNumber}`;
     const commitSha = makeShortSha();
-    const prId = `pr-${nextPrNumber}`;
+    const reviewLabel = getJiraTransitionLabel(resolvedRepoConfig, 'pr_opened');
 
     const addCheckpoint = async (
       stage: PublishCheckpoint['stage'],
@@ -959,29 +1154,53 @@ export async function runSolvePipeline(params: StartSolveParams): Promise<SolveR
     await addCheckpoint('tree', 'before', `Create Git tree on ${baseSha.slice(0, 7)}`);
     await addCheckpoint('tree', 'after', `Git tree created`);
 
-    await addCheckpoint('commit', 'before', `Commit ${ticket.key} changes`);
+    await addCheckpoint('commit', 'before', `Commit ${ticket.key} changes (${idempotencyKey})`);
     await addCheckpoint('commit', 'after', `Commit ${commitSha.slice(0, 7)} recorded`);
 
-    await addCheckpoint('branch', 'before', `Create ref refs/heads/${headBranch}`);
-    await addCheckpoint('branch', 'after', `Branch ${headBranch} created`);
+    await addCheckpoint(
+      'branch',
+      'before',
+      reusedPr
+        ? `Fast-forward existing ref refs/heads/${headBranch}`
+        : `Create ref refs/heads/${headBranch}`
+    );
+    await addCheckpoint(
+      'branch',
+      'after',
+      reusedPr ? `Branch ${headBranch} updated idempotently` : `Branch ${headBranch} created`
+    );
 
-    await addCheckpoint('pullRequest', 'before', `Open Draft PR #${nextPrNumber} -> ${ticket.baseBranch}`);
-    await addCheckpoint('pullRequest', 'after', `Draft PR #${nextPrNumber} confirmed`);
+    await addCheckpoint(
+      'pullRequest',
+      'before',
+      reusedPr
+        ? `Update existing Draft PR #${prNumber} -> ${effectiveTicket.baseBranch}`
+        : `Open Draft PR #${prNumber} -> ${effectiveTicket.baseBranch}`
+    );
+    await addCheckpoint(
+      'pullRequest',
+      'after',
+      reusedPr
+        ? `Draft PR #${prNumber} updated (idempotent)`
+        : `Draft PR #${prNumber} confirmed`
+    );
 
     run.jiraStatusCurrent = 'in_review';
 
     const passedCount = finalCheck.testSuite.filter((t) => t.status === 'passed').length;
     const draftPr: PullRequest = {
       id: prId,
-      number: nextPrNumber,
+      number: prNumber,
       title: patchResult?.prTitle || `feat(${ticket.key.toLowerCase()}): ${ticket.title}`,
       summary:
         patchResult?.prSummary ||
         `Draft PR generated by Patchline 5-Stage Solve pipeline for ${ticket.key}.`,
-      repo: ticket.repo,
-      baseBranch: ticket.baseBranch,
+      repo: effectiveTicket.repo,
+      baseBranch: effectiveTicket.baseBranch,
       baseSha,
       headBranch,
+      packagePath,
+      idempotencyKey,
       commitSha,
       draft: true,
       linkedTicketKey: ticket.key,
@@ -1002,7 +1221,9 @@ export async function runSolvePipeline(params: StartSolveParams): Promise<SolveR
         {
           id: `aud-${Date.now()}-1`,
           actor: 'Patchline Solve',
-          action: `Opened Draft PR #${nextPrNumber} on ${headBranch} (base ${baseSha.slice(0, 7)})`,
+          action: reusedPr
+            ? `Updated existing Draft PR #${prNumber} on ${headBranch} (${idempotencyKey})`
+            : `Opened Draft PR #${prNumber} on ${headBranch} (base ${baseSha.slice(0, 7)})`,
           timestamp: 'Just now',
         },
         {
@@ -1014,7 +1235,7 @@ export async function runSolvePipeline(params: StartSolveParams): Promise<SolveR
         {
           id: `aud-${Date.now()}-3`,
           actor: 'Jira Sync',
-          action: `Moved ${ticket.key} To Do -> In Progress -> In Review (human merge decides Done)`,
+          action: `Moved ${ticket.key} To Do -> In Progress -> ${reviewLabel} (human merge decides Done)`,
           timestamp: 'Just now',
         },
       ],

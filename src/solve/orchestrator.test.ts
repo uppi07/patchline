@@ -295,3 +295,99 @@ test('Mid-run Stage 3 429 quota error after Stage 2 plan succeeds falls back cle
   assert.equal(run.prResult?.number, 1087);
 });
 
+test('Ambiguous auto-resolved ticket stops at Stage 0 needs_info and monorepo packagePath scopes indexing cleanly', async () => {
+  const { SEED_REPOSITORIES } = await import('../data/seedData');
+
+  const ambiguousRun = await runSolvePipeline({
+    runId: 'run-ambiguous-repo',
+    ticket: makeTicket({
+      id: 'tkt-plat-431',
+      key: 'PLAT-431',
+      repo: 'auto',
+      repoResolution: 'auto',
+      jiraProject: 'PLAT',
+      components: ['webhooks', 'invoice'],
+      title: 'Standardize retry backoff across webhook and invoice worker queues',
+      description: 'Shared retry policy affects both webhooks and invoice worker queue retries.',
+      targetFiles: [],
+    }),
+    baseSha: '9d42f18a6b7e3c01d529a4f8e1c6b03d2a7e5190',
+    scopeRevision: 1,
+    executionMode: 'bounded',
+    maxModelCalls: 3,
+    testCommand: 'npx vitest run',
+    nextPrNumber: 1088,
+    repositories: SEED_REPOSITORIES,
+  });
+
+  assert.equal(ambiguousRun.status, 'needs_info');
+  assert.equal(ambiguousRun.jiraStatusCurrent, 'ready');
+  assert.equal(ambiguousRun.repoResolution?.status, 'ambiguous');
+  assert.ok((ambiguousRun.repoResolution?.candidates.length || 0) >= 2);
+
+  // Confirming target monorepo + package scopes indexing and passes verification
+  const scopedRun = await runSolvePipeline({
+    runId: 'run-scoped-monorepo',
+    ticket: makeTicket({
+      id: 'tkt-plat-431',
+      key: 'PLAT-431',
+      repo: 'acme-corp/platform-monorepo',
+      baseBranch: 'main',
+      repoResolution: 'explicit',
+      packagePath: 'packages/retry-policy',
+      title: 'Add bounded full-jitter exponential backoff',
+      description: 'Add jitterRatio option to computeBackoffDelay inside retry-policy.',
+      targetFiles: [
+        'packages/retry-policy/src/backoff.ts',
+        'packages/retry-policy/src/backoff.test.ts',
+      ],
+    }),
+    baseSha: '9d42f18a6b7e3c01d529a4f8e1c6b03d2a7e5190',
+    scopeRevision: 2,
+    executionMode: 'bounded',
+    maxModelCalls: 3,
+    testCommand: 'pnpm --filter @acme/retry-policy test',
+    nextPrNumber: 1088,
+    repositories: SEED_REPOSITORIES,
+  });
+
+  assert.equal(scopedRun.status, 'succeeded');
+  assert.equal(scopedRun.packagePath, 'packages/retry-policy');
+  assert.equal(scopedRun.indexedFilesCount, 4);
+  assert.equal(scopedRun.prResult?.packagePath, 'packages/retry-policy');
+  assert.equal(scopedRun.prResult?.number, 1088);
+});
+
+test('Re-running with existing open Draft PR on identical headBranch updates idempotently', async () => {
+  const firstRun = await runSolvePipeline({
+    runId: 'run-idem-1',
+    ticket: makeTicket(),
+    baseSha: 'a4f9c2e8b10d3e7f6a92c4180d5e2b7a1c3f8901',
+    scopeRevision: 1,
+    executionMode: 'bounded',
+    maxModelCalls: 3,
+    testCommand: 'npx vitest run',
+    nextPrNumber: 1089,
+  });
+
+  assert.equal(firstRun.status, 'succeeded');
+  assert.ok(firstRun.prResult);
+
+  const secondRun = await runSolvePipeline({
+    runId: 'run-idem-2',
+    ticket: makeTicket(),
+    baseSha: 'a4f9c2e8b10d3e7f6a92c4180d5e2b7a1c3f8901',
+    scopeRevision: 2,
+    executionMode: 'bounded',
+    maxModelCalls: 3,
+    testCommand: 'npx vitest run',
+    nextPrNumber: 1099,
+    existingOpenPr: firstRun.prResult,
+  });
+
+  assert.equal(secondRun.status, 'succeeded');
+  assert.equal(secondRun.reusedExistingPr, true);
+  assert.equal(secondRun.prResult?.number, 1089);
+});
+
+

@@ -318,6 +318,89 @@ export const REPO_SNAPSHOTS: Record<string, RepoSnapshotSeed> = {
       },
     ],
   },
+  'acme-corp/platform-monorepo': {
+    fullName: 'acme-corp/platform-monorepo',
+    defaultBranch: 'main',
+    baseSha: '9d42f18a6b7e3c01d529a4f8e1c6b03d2a7e5190',
+    testCommand: 'pnpm --filter @acme/retry-policy test',
+    files: [
+      {
+        path: 'package.json',
+        language: 'json',
+        content: [
+          '{',
+          '  "name": "@acme/platform-monorepo",',
+          '  "private": true,',
+          '  "workspaces": ["packages/*", "apps/*"]',
+          '}',
+        ].join('\n'),
+      },
+      {
+        path: 'packages/retry-policy/package.json',
+        language: 'json',
+        content: [
+          '{',
+          '  "name": "@acme/retry-policy",',
+          '  "version": "1.2.0",',
+          '  "type": "module",',
+          '  "scripts": { "test": "vitest run" }',
+          '}',
+        ].join('\n'),
+      },
+      {
+        path: 'packages/retry-policy/src/backoff.ts',
+        language: 'typescript',
+        content: [
+          'export interface BackoffOptions {',
+          '  baseMs: number;',
+          '  maxMs: number;',
+          '}',
+          '',
+          'export function computeBackoffDelay(attempt: number, opts: BackoffOptions): number {',
+          '  const exp = opts.baseMs * Math.pow(2, Math.max(0, attempt));',
+          '  return Math.min(opts.maxMs, exp);',
+          '}',
+        ].join('\n'),
+      },
+      {
+        path: 'packages/retry-policy/src/backoff.test.ts',
+        language: 'typescript',
+        content: [
+          'import { describe, expect, it } from "vitest";',
+          'import { computeBackoffDelay } from "./backoff";',
+          '',
+          'describe("computeBackoffDelay", () => {',
+          '  it("caps delay at maxMs", () => {',
+          '    expect(computeBackoffDelay(10, { baseMs: 100, maxMs: 2000 })).toBe(2000);',
+          '  });',
+          '});',
+        ].join('\n'),
+      },
+      {
+        path: 'apps/edge-gateway/src/router.ts',
+        language: 'typescript',
+        content: [
+          'export function routeEdgeRequest(path: string): string {',
+          '  return path.startsWith("/v1/webhooks") ? "payments-upstream" : "core-upstream";',
+          '}',
+        ].join('\n'),
+      },
+      {
+        path: 'apps/edge-gateway/src/router.test.ts',
+        language: 'typescript',
+        content: [
+          'import { describe, expect, it } from "vitest";',
+          'import { routeEdgeRequest } from "./router";',
+          '',
+          'describe("routeEdgeRequest", () => {',
+          '  it("routes webhooks", () => {',
+          '    expect(routeEdgeRequest("/v1/webhooks/stripe")).toBe("payments-upstream");',
+          '  });',
+          '});',
+        ].join('\n'),
+      },
+    ],
+  },
 };
 
 export function getSnapshotSeed(repoFullName: string): RepoSnapshotSeed {

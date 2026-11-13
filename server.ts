@@ -12,8 +12,19 @@ import {
   isQuotaExhaustedError,
   markQuotaCooldownFromError,
 } from './src/solve/quotaGuard.ts';
+import {
+  buildIdempotencyKey,
+  resolveTargetRepository,
+} from './src/solve/repoResolver.ts';
 import { REPO_SNAPSHOTS } from './src/solve/repoSnapshots.ts';
-import type { JiraTicket, ReviewFinding, SolveExecutionMode, SolveRun } from './src/types.ts';
+import type {
+  JiraTicket,
+  PullRequest,
+  RepositoryConfig,
+  ReviewFinding,
+  SolveExecutionMode,
+  SolveRun,
+} from './src/types.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -344,6 +355,18 @@ async function startServer() {
     res.json({ ok: true });
   });
 
+  app.post('/api/solve/resolve', (req, res) => {
+    const { ticket, repositories = [] } = req.body as {
+      ticket?: JiraTicket;
+      repositories?: RepositoryConfig[];
+    };
+    if (!ticket || !ticket.key) {
+      return res.status(400).json({ error: 'Valid Jira ticket payload is required.' });
+    }
+    const resolution = resolveTargetRepository(ticket, repositories);
+    return res.json({ resolution });
+  });
+
   app.post('/api/solve/runs', (req, res) => {
     const {
       ticket,
@@ -354,6 +377,9 @@ async function startServer() {
       testCommand: rawTestCommand,
       guidance,
       nextPrNumber = 1082,
+      repositories = [],
+      existingOpenPr,
+      upstreamHeadSha,
     } = req.body as {
       ticket?: JiraTicket;
       baseSha?: string;
@@ -363,6 +389,9 @@ async function startServer() {
       testCommand?: string;
       guidance?: string;
       nextPrNumber?: number;
+      repositories?: RepositoryConfig[];
+      existingOpenPr?: PullRequest;
+      upstreamHeadSha?: string;
     };
 
     if (!ticket || !ticket.id || !ticket.key || !ticket.title) {
@@ -380,9 +409,15 @@ async function startServer() {
       }
     }
 
-    const snapshot = REPO_SNAPSHOTS[ticket.repo];
+    const resolution =
+      repositories.length > 0 ? resolveTargetRepository(ticket, repositories) : undefined;
+    const effectiveRepo = resolution?.resolvedRepo || ticket.repo;
+    const effectiveBranch = resolution?.baseBranch || ticket.baseBranch || 'main';
+    const snapshot = REPO_SNAPSHOTS[effectiveRepo];
+    const repoConfig = repositories.find((r) => r.fullName === effectiveRepo);
     const baseSha =
       (requestedSha && requestedSha.trim()) ||
+      repoConfig?.pinnedSha ||
       ticket.pinnedSha ||
       snapshot?.baseSha ||
       'a4f9c2e8b10d3e7f6a92c4180d5e2b7a1c3f8901';
@@ -396,6 +431,7 @@ async function startServer() {
         : 3;
     const testCommand =
       (rawTestCommand && rawTestCommand.trim()) ||
+      repoConfig?.testCommand ||
       snapshot?.testCommand ||
       'npx vitest run';
 
@@ -404,15 +440,20 @@ async function startServer() {
     const cooldown = hasGemini ? getActiveQuotaCooldown(apiKey) : null;
     const runId = `solve-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     const now = new Date().toISOString();
+    const rev = Number(scopeRevision) || 1;
 
     const initialRun: SolveRun = {
       id: runId,
       ticketId: ticket.id,
       ticketKey: ticket.key,
-      repo: ticket.repo,
-      baseBranch: ticket.baseBranch || 'main',
+      repo: effectiveRepo,
+      baseBranch: effectiveBranch,
       baseSha,
-      scopeRevision: Number(scopeRevision) || 1,
+      upstreamHeadSha: upstreamHeadSha || repoConfig?.upstreamHeadSha || baseSha,
+      packagePath: resolution?.packagePath || ticket.packagePath,
+      idempotencyKey: buildIdempotencyKey(ticket.key, rev, baseSha),
+      repoResolution: resolution,
+      scopeRevision: rev,
       executionMode,
       maxModelCalls,
       modelCallsUsed: 0,
@@ -449,6 +490,9 @@ async function startServer() {
       testCommand,
       guidance,
       nextPrNumber: Number(nextPrNumber) || 1082,
+      repositories,
+      existingOpenPr,
+      upstreamHeadSha,
       geminiApiKey: hasGemini ? apiKey : undefined,
       signal: controller.signal,
       onUpdate: (updated) => broadcastSolveUpdate(runId, updated),

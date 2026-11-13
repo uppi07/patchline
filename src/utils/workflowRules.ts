@@ -18,8 +18,8 @@ export function validateNewTicket(input: NewTicketInput): TicketValidationResult
     errors.title = 'Title must be at least 5 characters.';
   }
 
-  if (!input.repo || !input.repo.includes('/')) {
-    errors.repo = 'Specify a repository in owner/name format.';
+  if (!input.repo || (input.repo !== 'auto' && !input.repo.includes('/'))) {
+    errors.repo = 'Select Auto-resolve or specify owner/name.';
   }
 
   if (!input.description || input.description.trim().length < 10) {

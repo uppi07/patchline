@@ -294,12 +294,14 @@ export async function runIsolatedVerification(
       }
     }
 
-    // Step B: Execute JS/TS test files inside bounded VM sandbox
+    // Step B: Execute JS/TS test files inside bounded VM sandbox (scoped to monorepo package when set)
+    const inScope = (filePath: string) =>
+      !workspace.packagePath || filePath.startsWith(`${workspace.packagePath}/`);
     const tsTestFiles = allFiles.filter(
-      (f) => /\.(test|spec)\.(ts|tsx|js)$/.test(f.path)
+      (f) => inScope(f.path) && /\.(test|spec)\.(ts|tsx|js)$/.test(f.path)
     );
     const pyTestFiles = allFiles.filter(
-      (f) => f.path.endsWith('.py') && f.path.includes('test')
+      (f) => inScope(f.path) && f.path.endsWith('.py') && f.path.includes('test')
     );
 
     for (const testFile of tsTestFiles) {
@@ -398,9 +400,10 @@ export async function runIsolatedVerification(
 export async function runBaselineComparison(
   repo: string,
   baseSha: string,
-  command: string
+  command: string,
+  packagePath?: string
 ): Promise<VerificationBaselineCheck> {
-  const baseWorkspace = new WorkspaceSnapshot(repo, baseSha);
+  const baseWorkspace = new WorkspaceSnapshot(repo, baseSha, [], packagePath);
   const baseOutcome = await runIsolatedVerification(baseWorkspace, command);
   const status = baseOutcome.report.status === 'passed' ? 'passed' : 'failed';
   return {

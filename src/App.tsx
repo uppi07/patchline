@@ -24,7 +24,7 @@ import type {
   WorkspaceTab,
 } from './types';
 
-const STORAGE_KEY = 'patchline_workbench_v1';
+const STORAGE_KEY = 'patchline_workbench_v2';
 const TERMINAL_SOLVE_STATUSES = new Set(['succeeded', 'needs_info', 'failed', 'cancelled']);
 
 let auditSeq = 0;
@@ -43,9 +43,13 @@ interface PersistedState {
 function hydrateRepositories(repos: RepositoryConfig[]): RepositoryConfig[] {
   return repos.map((repo) => {
     const seedMatch = SEED_REPOSITORIES.find((s) => s.fullName === repo.fullName);
+    const pinnedSha =
+      repo.pinnedSha || seedMatch?.pinnedSha || 'a4f9c2e8b10d3e7f6a92c4180d5e2b7a1c3f8901';
     return {
+      ...seedMatch,
       ...repo,
-      pinnedSha: repo.pinnedSha || seedMatch?.pinnedSha || 'a4f9c2e8b10d3e7f6a92c4180d5e2b7a1c3f8901',
+      pinnedSha,
+      upstreamHeadSha: repo.upstreamHeadSha || seedMatch?.upstreamHeadSha || pinnedSha,
     };
   });
 }
@@ -235,6 +239,10 @@ export default function App() {
       [ticket.id]: nextScopeRev,
     }));
 
+    const existingOpenPr = ticket.linkedPrId
+      ? pullRequests.find((p) => p.id === ticket.linkedPrId && p.status !== 'merged')
+      : undefined;
+
     const nextPrNumber =
       Math.max(1081, ...pullRequests.map((p) => p.number)) + 1;
 
@@ -251,6 +259,9 @@ export default function App() {
           testCommand: repoConfig?.testCommand || 'npx vitest run',
           guidance,
           nextPrNumber,
+          repositories,
+          existingOpenPr,
+          upstreamHeadSha: repoConfig?.upstreamHeadSha,
         }),
       });
       const data = await res.json();
@@ -566,10 +577,87 @@ export default function App() {
     }
   };
 
+  const handleResolveAmbiguousTarget = (
+    repo: string,
+    baseBranch: string,
+    packagePath?: string
+  ) => {
+    if (!selectedTicket) return;
+    const repoConfig = repositories.find((r) => r.fullName === repo);
+    const updatedTicket: JiraTicket = {
+      ...selectedTicket,
+      repo,
+      baseBranch,
+      packagePath,
+      pinnedSha:
+        repoConfig?.pinnedSha ||
+        selectedTicket.pinnedSha ||
+        'a4f9c2e8b10d3e7f6a92c4180d5e2b7a1c3f8901',
+      repoResolution: 'explicit',
+      targetFiles:
+        repo === 'acme-corp/platform-monorepo' &&
+        selectedTicket.targetFiles.length === 0
+          ? [
+              'packages/retry-policy/src/backoff.ts',
+              'packages/retry-policy/src/backoff.test.ts',
+            ]
+          : selectedTicket.targetFiles,
+      updatedAt: 'Just now',
+    };
+
+    setTickets((prev) =>
+      prev.map((t) => (t.id === updatedTicket.id ? updatedTicket : t))
+    );
+    void handleStartSolve(updatedTicket, '');
+  };
+
+  const handleSyncToLatestSha = (ticketId: string) => {
+    const targetTicket = tickets.find((t) => t.id === ticketId);
+    if (!targetTicket) return;
+    const repoMatch = repositories.find((r) => r.fullName === targetTicket.repo);
+    const latestSha = repoMatch?.upstreamHeadSha;
+    if (!latestSha) return;
+
+    setRepositories((prev) =>
+      prev.map((r) =>
+        r.fullName === targetTicket.repo ? { ...r, pinnedSha: latestSha } : r
+      )
+    );
+    setTickets((prev) =>
+      prev.map((t) =>
+        t.id === ticketId ? { ...t, pinnedSha: latestSha, updatedAt: 'Just now' } : t
+      )
+    );
+  };
+
+  const handleSimulateUpstreamPush = (repoId: string) => {
+    const newSha = Array.from({ length: 40 }, () =>
+      Math.floor(Math.random() * 16).toString(16)
+    ).join('');
+    setRepositories((prev) =>
+      prev.map((r) => (r.id === repoId ? { ...r, upstreamHeadSha: newSha } : r))
+    );
+  };
+
+  const handleAddRepository = (
+    repoData: Omit<RepositoryConfig, 'id' | 'openPrCount'>
+  ) => {
+    const newRepo: RepositoryConfig = {
+      ...repoData,
+      id: `repo-${Date.now()}`,
+      openPrCount: 0,
+    };
+    setRepositories((prev) => [newRepo, ...prev]);
+  };
+
   const handleCreateTicket = (input: NewTicketInput) => {
     const nextNum = 426 + tickets.length;
     const key = input.key || `ENG-${nextNum}`;
     const repoMatch = repositories.find((r) => r.fullName === input.repo);
+    const labels = (input.labelsText || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
     const newTicket: JiraTicket = {
       id: `tkt-${Date.now()}`,
       key,
@@ -580,9 +668,13 @@ export default function App() {
         .map((l) => l.trim())
         .filter(Boolean),
       repo: input.repo,
-      baseBranch: repoMatch?.defaultBranch || 'main',
+      baseBranch: input.baseBranch?.trim() || repoMatch?.defaultBranch || 'main',
       pinnedSha:
         repoMatch?.pinnedSha || 'a4f9c2e8b10d3e7f6a92c4180d5e2b7a1c3f8901',
+      jiraProject: key.split('-')[0],
+      labels,
+      packagePath: input.packagePath,
+      repoResolution: input.repoResolution || (input.repo === 'auto' ? 'auto' : 'explicit'),
       targetFiles: input.targetFilesText
         .split(',')
         .map((s) => s.trim())
@@ -648,7 +740,9 @@ export default function App() {
             <TicketToPrView
               key={selectedTicket.id}
               ticket={selectedTicket}
+              repositories={repositories}
               pinnedSha={selectedPinnedSha}
+              upstreamHeadSha={selectedRepoConfig?.upstreamHeadSha}
               scopeRevision={scopeRevisionByTicket[selectedTicket.id] || 1}
               linkedPr={linkedPr}
               solveRun={solveRunsByTicket[selectedTicket.id]}
@@ -659,6 +753,8 @@ export default function App() {
               onChangeExecutionMode={setExecutionMode}
               onChangeBudgetLimit={setBudgetLimit}
               onStartSolve={handleStartSolve}
+              onResolveAmbiguousTarget={handleResolveAmbiguousTarget}
+              onSyncToLatestSha={handleSyncToLatestSha}
               onCancelSolve={handleCancelSolve}
               onRerunTests={handleRerunTests}
               onRunAiReview={handleRunAiReview}
@@ -724,6 +820,8 @@ export default function App() {
                   )
                 )
               }
+              onSimulateUpstreamPush={handleSimulateUpstreamPush}
+              onAddRepository={handleAddRepository}
             />
           )}
         </main>

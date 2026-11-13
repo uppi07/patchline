@@ -125,6 +125,7 @@ export class WorkspaceSnapshot {
   public readonly baseBranch: string;
   public readonly baseSha: string;
   public readonly testCommand: string;
+  public readonly packagePath?: string;
 
   private readonly baseFiles = new Map<string, SnapshotFileSeed>();
   private readonly stagedFiles = new Map<string, SnapshotFileSeed>();
@@ -133,13 +134,15 @@ export class WorkspaceSnapshot {
   constructor(
     repo: string,
     overrideBaseSha?: string,
-    extraSeedPaths: string[] = []
+    extraSeedPaths: string[] = [],
+    packagePath?: string
   ) {
     const seed = getSnapshotSeed(repo);
     this.repo = seed.fullName;
     this.baseBranch = seed.defaultBranch;
     this.baseSha = overrideBaseSha || seed.baseSha;
     this.testCommand = seed.testCommand;
+    this.packagePath = packagePath ? packagePath.replace(/^\/+|\/+$/g, '') : undefined;
 
     for (const file of seed.files) {
       this.baseFiles.set(file.path, { ...file });
@@ -157,9 +160,20 @@ export class WorkspaceSnapshot {
     }
   }
 
+  getTotalRepoFilesCount(): number {
+    return new Set([...this.baseFiles.keys(), ...this.stagedFiles.keys()]).size;
+  }
+
+  private isInPackageScope(filePath: string): boolean {
+    if (!this.packagePath) return true;
+    if (filePath.startsWith(`${this.packagePath}/`)) return true;
+    return filePath === 'package.json' || filePath === 'tsconfig.json' || filePath === 'pyproject.toml';
+  }
+
   indexFiles(): IndexedFileEntry[] {
     const paths = new Set([...this.baseFiles.keys(), ...this.stagedFiles.keys()]);
     return [...paths]
+      .filter((filePath) => this.isInPackageScope(filePath))
       .sort((a, b) => a.localeCompare(b))
       .map((filePath) => {
         const file = this.stagedFiles.get(filePath) ?? this.baseFiles.get(filePath)!;

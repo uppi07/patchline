@@ -16,6 +16,7 @@ interface SolvePipelinePanelProps {
   run: SolveRun;
   onCancel: (runId: string) => void;
   onRetry: () => void;
+  onResolveAmbiguousTarget?: (repo: string, baseBranch: string, packagePath?: string) => void;
 }
 
 const STAGES: Array<{ id: SolveStageId; code: string; label: string }> = [
@@ -37,6 +38,7 @@ export function SolvePipelinePanel({
   run,
   onCancel,
   onRetry,
+  onResolveAmbiguousTarget,
 }: SolvePipelinePanelProps) {
   const [traceTab, setTraceTab] = useState<'plan' | 'tools' | 'verify' | 'checkpoints'>(
     run.verification ? 'verify' : 'tools'
@@ -134,6 +136,39 @@ export function SolvePipelinePanel({
                 {run.source === 'gemini' ? 'Gemini' : 'Built-in'}
               </strong>
             </span>
+            {run.repoResolution && (
+              <>
+                <span aria-hidden="true">·</span>
+                <span>
+                  Resolver:{' '}
+                  <strong className="font-mono font-medium text-slate-800 dark:text-slate-200">
+                    L{run.repoResolution.level} ({run.repoResolution.strategy})
+                  </strong>
+                </span>
+              </>
+            )}
+            {run.packagePath && (
+              <>
+                <span aria-hidden="true">·</span>
+                <span>
+                  Scope:{' '}
+                  <strong className="font-mono font-medium text-slate-800 dark:text-slate-200">
+                    {run.packagePath}
+                  </strong>
+                </span>
+              </>
+            )}
+            {run.idempotencyKey && (
+              <>
+                <span aria-hidden="true">·</span>
+                <span>
+                  Key:{' '}
+                  <strong className="font-mono font-medium text-slate-800 dark:text-slate-200">
+                    {run.idempotencyKey}
+                  </strong>
+                </span>
+              </>
+            )}
           </div>
 
           {run.fallbackReason && (
@@ -239,7 +274,9 @@ export function SolvePipelinePanel({
       {run.status === 'needs_info' && run.questions && run.questions.length > 0 && (
         <div className="border-b border-slate-200 bg-amber-50/60 px-5 py-4 dark:border-slate-800 dark:bg-amber-950/20">
           <div className="text-xs font-semibold text-amber-900 dark:text-amber-200">
-            Clarification required before writing code (Jira kept in To Do)
+            {run.repoResolution?.status === 'ambiguous'
+              ? 'Ambiguity Gate (Level 4): Confirm target repository & branch before indexing (Jira kept in To Do)'
+              : 'Clarification required before writing code (Jira kept in To Do)'}
           </div>
           <ul className="mt-2 space-y-1.5 text-xs text-amber-800 dark:text-amber-300">
             {run.questions.map((q, idx) => (
@@ -249,8 +286,42 @@ export function SolvePipelinePanel({
               </li>
             ))}
           </ul>
+
+          {run.repoResolution?.status === 'ambiguous' &&
+            run.repoResolution.candidates.length > 0 &&
+            onResolveAmbiguousTarget && (
+              <div className="mt-3 flex flex-wrap gap-2">
+                {run.repoResolution.candidates.map((cand) => (
+                  <button
+                    key={`${cand.repo}-${cand.baseBranch}`}
+                    type="button"
+                    onClick={() =>
+                      onResolveAmbiguousTarget(
+                        cand.repo,
+                        cand.baseBranch,
+                        cand.repo === 'acme-corp/platform-monorepo'
+                          ? cand.packagePath || 'packages/retry-policy'
+                          : cand.packagePath
+                      )
+                    }
+                    className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-amber-300 bg-white px-3 font-mono text-[11px] font-semibold text-amber-900 transition-colors hover:bg-amber-100/70 dark:border-amber-800 dark:bg-slate-900 dark:text-amber-200 dark:hover:bg-amber-950/60"
+                  >
+                    <span>
+                      Use {cand.repo} ({cand.baseBranch}
+                      {cand.repo === 'acme-corp/platform-monorepo'
+                        ? ` · ${cand.packagePath || 'packages/retry-policy'}`
+                        : ''}
+                      )
+                    </span>
+                  </button>
+                ))}
+              </div>
+            )}
+
           <p className="mt-2 text-[11px] text-amber-700 dark:text-amber-400">
-            Add answers in Engineering Guidance and start a new Solve run.
+            {run.repoResolution?.status === 'ambiguous'
+              ? 'Select a candidate repository above to lock the target and start solving.'
+              : 'Add answers in Engineering Guidance and start a new Solve run.'}
           </p>
         </div>
       )}

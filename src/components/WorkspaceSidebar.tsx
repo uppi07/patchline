@@ -311,7 +311,11 @@ export function WorkspaceSidebar({
                     {ticket.title}
                   </div>
                   <div className="mt-1.5 flex items-center gap-1.5 text-[11px] text-slate-500 dark:text-slate-400">
-                    <span className="truncate">{ticket.repo.split('/')[1]}</span>
+                    <span className="truncate">
+                      {ticket.repo === 'auto'
+                        ? 'auto-resolve'
+                        : ticket.repo.split('/')[1] || ticket.repo}
+                    </span>
                     <span aria-hidden="true">·</span>
                     {ticket.id === activeSolveTicketId ? (
                       <span className="shrink-0 font-medium text-blue-600 dark:text-blue-400">

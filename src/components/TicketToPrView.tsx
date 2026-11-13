@@ -9,6 +9,7 @@ import {
   RotateCw,
   ScanSearch,
 } from 'lucide-react';
+import { resolveTargetRepository } from '../solve/repoResolver';
 import { computeDiffStats } from '../utils/diffParser';
 import { DiffViewer } from './DiffViewer';
 import { HumanMergeGate } from './HumanMergeGate';
@@ -17,13 +18,16 @@ import type {
   JiraTicket,
   MergeStrategy,
   PullRequest,
+  RepositoryConfig,
   SolveExecutionMode,
   SolveRun,
 } from '../types';
 
 interface TicketToPrViewProps {
   ticket: JiraTicket;
+  repositories: RepositoryConfig[];
   pinnedSha: string;
+  upstreamHeadSha?: string;
   scopeRevision: number;
   linkedPr?: PullRequest;
   solveRun?: SolveRun;
@@ -34,6 +38,8 @@ interface TicketToPrViewProps {
   onChangeExecutionMode: (mode: SolveExecutionMode) => void;
   onChangeBudgetLimit: (limit: 3 | 12) => void;
   onStartSolve: (ticket: JiraTicket, guidance: string) => void;
+  onResolveAmbiguousTarget: (repo: string, baseBranch: string, packagePath?: string) => void;
+  onSyncToLatestSha: (ticketId: string) => void;
   onCancelSolve: (runId: string) => void;
   onRerunTests: (prId: string) => void;
   onRunAiReview: (prId: string) => void;
@@ -49,7 +55,9 @@ interface TicketToPrViewProps {
 
 export function TicketToPrView({
   ticket,
+  repositories,
   pinnedSha,
+  upstreamHeadSha,
   scopeRevision,
   linkedPr,
   solveRun,
@@ -60,6 +68,8 @@ export function TicketToPrView({
   onChangeExecutionMode,
   onChangeBudgetLimit,
   onStartSolve,
+  onResolveAmbiguousTarget,
+  onSyncToLatestSha,
   onCancelSolve,
   onRerunTests,
   onRunAiReview,
@@ -77,6 +87,18 @@ export function TicketToPrView({
 
   const isSolving =
     solveRun?.status === 'queued' || solveRun?.status === 'running';
+
+  const resolutionPreview = resolveTargetRepository(ticket, repositories);
+  const resolvedRepoDisplay =
+    resolutionPreview.resolvedRepo ||
+    (ticket.repo === 'auto' ? 'Auto-resolve (Needs Confirm)' : ticket.repo);
+  const resolvedBranchDisplay =
+    resolutionPreview.baseBranch || ticket.baseBranch || 'main';
+  const hasUpstreamDrift =
+    Boolean(upstreamHeadSha) && upstreamHeadSha !== pinnedSha;
+  const hasPrDrift =
+    Boolean(upstreamHeadSha && linkedPr?.baseSha) &&
+    upstreamHeadSha !== linkedPr?.baseSha;
 
   const diffStats = linkedPr ? computeDiffStats(linkedPr.files) : null;
   const passedTests = linkedPr
@@ -158,6 +180,7 @@ export function TicketToPrView({
           run={solveRun}
           onCancel={onCancelSolve}
           onRetry={() => onStartSolve(ticket, guidance)}
+          onResolveAmbiguousTarget={onResolveAmbiguousTarget}
         />
       )}
 
@@ -214,6 +237,35 @@ export function TicketToPrView({
                   </p>
                 )}
               </div>
+
+              {(ticket.labels?.length || ticket.crossRepoDependencies?.length || ticket.packagePath) && (
+                <div className="mt-5 space-y-1.5 border-t border-slate-200 pt-4 text-xs text-slate-500 dark:border-slate-800 dark:text-slate-400">
+                  {ticket.labels && ticket.labels.length > 0 && (
+                    <div>
+                      Jira Labels:{' '}
+                      <span className="font-mono text-slate-700 dark:text-slate-300">
+                        {ticket.labels.join(' · ')}
+                      </span>
+                    </div>
+                  )}
+                  {ticket.packagePath && (
+                    <div>
+                      Monorepo Scope:{' '}
+                      <span className="font-mono text-slate-700 dark:text-slate-300">
+                        {ticket.packagePath}
+                      </span>
+                    </div>
+                  )}
+                  {ticket.crossRepoDependencies && ticket.crossRepoDependencies.length > 0 && (
+                    <div>
+                      Cross-Repo Links:{' '}
+                      <span className="font-mono text-slate-700 dark:text-slate-300">
+                        {ticket.crossRepoDependencies.join(' · ')}
+                      </span>
+                    </div>
+                  )}
+                </div>
+              )}
             </section>
           </div>
 
@@ -303,11 +355,49 @@ export function TicketToPrView({
 
               <div className="mt-4 space-y-2 border-t border-slate-200 pt-4 text-xs text-slate-600 dark:border-slate-800 dark:text-slate-400">
                 <div className="flex items-center justify-between gap-2">
-                  <span>Pinned snapshot</span>
-                  <span className="font-mono text-slate-900 tabular-nums dark:text-slate-200">
-                    {ticket.baseBranch} @ {pinnedSha.slice(0, 7)}
+                  <span>Repo resolver</span>
+                  <span
+                    className={`font-mono font-medium ${
+                      resolutionPreview.status === 'ambiguous'
+                        ? 'text-amber-700 dark:text-amber-400'
+                        : 'text-slate-900 dark:text-slate-200'
+                    }`}
+                  >
+                    L{resolutionPreview.level} · {resolutionPreview.strategy}
                   </span>
                 </div>
+                <div className="flex items-center justify-between gap-2">
+                  <span>Target repo</span>
+                  <span className="truncate font-mono text-slate-900 dark:text-slate-200">
+                    {resolvedRepoDisplay}
+                  </span>
+                </div>
+                {resolutionPreview.packagePath && (
+                  <div className="flex items-center justify-between gap-2">
+                    <span>Monorepo scope</span>
+                    <span className="font-mono text-slate-900 dark:text-slate-200">
+                      {resolutionPreview.packagePath}
+                    </span>
+                  </div>
+                )}
+                <div className="flex items-center justify-between gap-2">
+                  <span>Pinned snapshot</span>
+                  <span className="font-mono text-slate-900 tabular-nums dark:text-slate-200">
+                    {resolvedBranchDisplay} @ {pinnedSha.slice(0, 7)}
+                  </span>
+                </div>
+                {hasUpstreamDrift && upstreamHeadSha && (
+                  <div className="flex items-center justify-between gap-2 text-[11px] text-amber-700 dark:text-amber-400">
+                    <span>Upstream moved to {upstreamHeadSha.slice(0, 7)}</span>
+                    <button
+                      type="button"
+                      onClick={() => onSyncToLatestSha(ticket.id)}
+                      className="font-semibold underline underline-offset-2 hover:text-amber-800 dark:hover:text-amber-300"
+                    >
+                      Sync SHA
+                    </button>
+                  </div>
+                )}
                 <div className="flex items-center justify-between gap-2">
                   <span>Scope revision</span>
                   <span className="font-mono text-slate-900 tabular-nums dark:text-slate-200">
@@ -401,6 +491,39 @@ export function TicketToPrView({
               <p className="mt-1.5 text-sm leading-relaxed text-slate-600 dark:text-slate-300">
                 {linkedPr.summary}
               </p>
+
+              {(linkedPr.packagePath || linkedPr.idempotencyKey || ticket.crossRepoDependencies?.length) && (
+                <div className="mt-2.5 flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[11px] text-slate-500 dark:text-slate-400">
+                  {linkedPr.packagePath && <span>Scope: {linkedPr.packagePath}</span>}
+                  {linkedPr.idempotencyKey && <span>Key: {linkedPr.idempotencyKey}</span>}
+                  {ticket.crossRepoDependencies && ticket.crossRepoDependencies.length > 0 && (
+                    <span>Deps: {ticket.crossRepoDependencies.join(', ')}</span>
+                  )}
+                </div>
+              )}
+
+              {hasPrDrift && upstreamHeadSha && linkedPr.status !== 'merged' && (
+                <div className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-200 bg-amber-50/70 px-3 py-2 text-xs text-amber-800 dark:border-amber-900/50 dark:bg-amber-950/20 dark:text-amber-200">
+                  <span>
+                    Base branch <code className="font-mono">{linkedPr.baseBranch}</code> advanced to{' '}
+                    <code className="font-mono">{upstreamHeadSha.slice(0, 7)}</code> (verified on{' '}
+                    <code className="font-mono">{linkedPr.baseSha?.slice(0, 7)}</code>).
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onSyncToLatestSha(ticket.id);
+                      onStartSolve(
+                        { ...ticket, pinnedSha: upstreamHeadSha },
+                        guidance
+                      );
+                    }}
+                    className="font-semibold underline underline-offset-2 hover:text-amber-900 dark:hover:text-amber-100"
+                  >
+                    Re-verify on {upstreamHeadSha.slice(0, 7)}
+                  </button>
+                </div>
+              )}
 
               {/* Segmented sub-tabs */}
               <div
@@ -590,6 +713,7 @@ export function TicketToPrView({
                 run={solveRun}
                 onCancel={onCancelSolve}
                 onRetry={() => onStartSolve(ticket, guidance)}
+                onResolveAmbiguousTarget={onResolveAmbiguousTarget}
               />
             )}
           </div>
